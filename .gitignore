@@ -34,6 +34,9 @@ log/
 .gradio/
 .history/
 temp/
+*.cache
+*.lock
+*.tmp
 
 # IDE / Editor Files
 .idea/
@@ -51,6 +54,36 @@ examples/input/
 examples/output/
 output*/
 data/
+
+# Experiment Results & Generated Data
+exp_results/
+agriculture/
+datasets/
+
+# Models & Datasets
+models_and_datasets/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+
+# Dataset Files
+*.jsonl
+*.csv
+*.tsv
+
+# Knowledge Graph Files
+*.graphml
+
+# Large JSON Files (experiment results)
+*_results.json
+*_errors.json
+*_evaluation.json
+*_questions.txt
+*_unique_contexts.json
+kv_store_*.json
+vdb_*.json
 
 # Miscellaneous
 .DS_Store
