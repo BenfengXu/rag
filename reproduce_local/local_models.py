@@ -13,14 +13,21 @@ from transformers import AutoTokenizer, AutoModel
 from typing import List, Any, Dict
 import asyncio
 import aiohttp
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # ==================== OSS LLM 配置 ====================
 import threading
 import random
 
-# 负载均衡配置
+# OSS LLM负载均衡配置
 _oss_counter = 0
 _oss_lock = threading.Lock()
+
+# ==================== Embedding服务配置 ====================
+# Embedding服务负载均衡配置
+_embedding_counter = 0
+_embedding_lock = threading.Lock()
+_use_remote_embedding = False  # 是否使用远程Embedding服务
 
 def get_oss_config():
     """获取OSS配置，支持多端口负载均衡"""
@@ -52,6 +59,46 @@ def get_oss_config():
         "host": oss_host
     }
 
+def get_embedding_config():
+    """获取Embedding配置，支持多端口负载均衡"""
+    global _embedding_counter
+    
+    # 从环境变量读取配置
+    embedding_host = os.getenv("EMBEDDING_HOST", "10.0.4.178")
+    embedding_ports = os.getenv("EMBEDDING_PORTS", "30151")
+    
+    # 解析端口列表
+    if "," in embedding_ports:
+        ports_list = [port.strip() for port in embedding_ports.split(",")]
+    else:
+        ports_list = [embedding_ports]
+    
+    # 轮询选择端口
+    with _embedding_lock:
+        port = ports_list[_embedding_counter % len(ports_list)]
+        _embedding_counter += 1
+    
+    return {
+        "url": f"http://{embedding_host}:{port}/v1/embeddings",
+        "headers": {
+            "Content-Type": "application/json"
+        },
+        "port": port,
+        "host": embedding_host
+    }
+
+def enable_remote_embedding():
+    """启用远程Embedding服务"""
+    global _use_remote_embedding
+    _use_remote_embedding = True
+    print("✅ 已启用远程Embedding服务")
+
+def disable_remote_embedding():
+    """禁用远程Embedding服务，使用本地模型"""
+    global _use_remote_embedding
+    _use_remote_embedding = False
+    print("✅ 已切换到本地Embedding模型")
+
 # ==================== Qwen Embedding 配置 ====================
 QWEN_MODEL_PATH = "/mnt/jfs/xubenfeng/rag/models_and_datasets/Qwen3-Embedding-0.6B"
 
@@ -74,7 +121,7 @@ def filter_json_serializable_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
     for key, value in kwargs.items():
         # 只处理允许的参数名
         if key not in allowed_params:
-            print(f"🔧 跳过非API参数: {key} = {type(value)}")
+            # print(f"🔧 跳过非API参数: {key} = {type(value)}")
             continue
             
         # 检查值的类型
@@ -171,6 +218,16 @@ def oss_llm_complete(
         print(f"❌ OSS API调用异常: 服务: {oss_config['host']}:{oss_config['port']}, 错误: {e}")
         return f"Error: {str(e)}"
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((
+        asyncio.TimeoutError,
+        aiohttp.ClientError,
+        ConnectionError,
+        OSError
+    ))
+)
 async def oss_llm_complete_async(
     prompt, 
     system_prompt=None, 
@@ -205,12 +262,14 @@ async def oss_llm_complete_async(
     }
     
     try:
-        async with aiohttp.ClientSession() as session:
+        # 创建连接器，限制并发连接数
+        connector = aiohttp.TCPConnector(limit=10, limit_per_host=5)
+        async with aiohttp.ClientSession(connector=connector) as session:
             async with session.post(
                 oss_config["url"], 
                 headers=oss_config["headers"], 
                 json=data,
-                timeout=aiohttp.ClientTimeout(total=60)
+                timeout=aiohttp.ClientTimeout(total=600)  # 增加超时时间
             ) as response:
                 
                 if response.status == 200:
@@ -233,17 +292,113 @@ async def oss_llm_complete_async(
                     print(f"错误信息: {error_text}")
                     return f"Error: {response.status} - {error_text}"
                     
+    except asyncio.TimeoutError:
+        print(f"⏰ OSS API超时: 服务: {oss_config['host']}:{oss_config['port']} (120秒)")
+        return "Error: Timeout after 120 seconds"
+    except aiohttp.ClientError as e:
+        print(f"🌐 OSS API连接错误: 服务: {oss_config['host']}:{oss_config['port']}, 错误: {e}")
+        return f"Error: Connection error - {str(e)}"
     except Exception as e:
-        print(f"❌ OSS API异步调用异常: 服务: {oss_config['host']}:{oss_config['port']}, 错误: {e}")
-        return f"Error: {str(e)}"
+        print(f"❌ OSS API异步调用异常: 服务: {oss_config['host']}:{oss_config['port']}, 错误类型: {type(e).__name__}, 详情: {e}")
+        return f"Error: {type(e).__name__} - {str(e)}"
+
+# ==================== 远程Embedding调用函数 ====================
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=5),
+    retry=retry_if_exception_type((
+        asyncio.TimeoutError,
+        aiohttp.ClientError,
+        ConnectionError,
+        OSError
+    ))
+)
+async def remote_embedding_async(texts: List[str]) -> np.ndarray:
+    """远程Embedding异步调用函数，支持负载均衡"""
+    embedding_config = get_embedding_config()
+    
+    data = {
+        "input": texts,
+        "model": "qwen-embedding"
+    }
+    
+    try:
+        # 创建连接器，限制并发连接数
+        connector = aiohttp.TCPConnector(limit=20, limit_per_host=10)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.post(
+                embedding_config["url"],
+                headers=embedding_config["headers"],
+                json=data,
+                timeout=aiohttp.ClientTimeout(total=60)
+            ) as response:
+                
+                if response.status == 200:
+                    result = await response.json()
+                    embeddings = []
+                    for item in result["data"]:
+                        embeddings.append(item["embedding"])
+                    return np.array(embeddings, dtype=np.float32)
+                else:
+                    error_text = await response.text()
+                    print(f"❌ Embedding API请求失败! 服务: {embedding_config['host']}:{embedding_config['port']}, 状态码: {response.status}")
+                    print(f"错误信息: {error_text}")
+                    raise RuntimeError(f"Embedding API Error: {response.status} - {error_text}")
+                    
+    except asyncio.TimeoutError:
+        print(f"⏰ Embedding API超时: 服务: {embedding_config['host']}:{embedding_config['port']} (60秒)")
+        raise
+    except aiohttp.ClientError as e:
+        print(f"🌐 Embedding API连接错误: 服务: {embedding_config['host']}:{embedding_config['port']}, 错误: {e}")
+        raise
+    except Exception as e:
+        print(f"❌ Embedding API异步调用异常: 服务: {embedding_config['host']}:{embedding_config['port']}, 错误类型: {type(e).__name__}, 详情: {e}")
+        raise
+
+def remote_embedding(texts: List[str]) -> np.ndarray:
+    """远程Embedding同步调用函数"""
+    embedding_config = get_embedding_config()
+    
+    data = {
+        "input": texts,
+        "model": "qwen-embedding"
+    }
+    
+    try:
+        response = requests.post(
+            embedding_config["url"],
+            headers=embedding_config["headers"],
+            json=data,
+            timeout=60
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            embeddings = []
+            for item in result["data"]:
+                embeddings.append(item["embedding"])
+            return np.array(embeddings, dtype=np.float32)
+        else:
+            print(f"❌ Embedding API请求失败! 服务: {embedding_config['host']}:{embedding_config['port']}, 状态码: {response.status_code}")
+            print(f"错误信息: {response.text}")
+            raise RuntimeError(f"Embedding API Error: {response.status_code} - {response.text}")
+            
+    except Exception as e:
+        print(f"❌ Embedding API调用异常: 服务: {embedding_config['host']}:{embedding_config['port']}, 错误: {e}")
+        raise e
 
 def qwen_embedding(texts: List[str]) -> np.ndarray:
     """
-    Qwen Embedding同步调用函数
+    Qwen Embedding同步调用函数 - 支持远程/本地切换
     """
-    global _tokenizer, _model, _device
+    global _use_remote_embedding, _tokenizer, _model, _device
     
-    # 确保模型已加载
+    # 如果启用了远程服务，使用远程调用
+    if _use_remote_embedding:
+        return remote_embedding(texts)
+    
+    # 本地模式：确保模型已加载
     if _tokenizer is None:
         init_qwen_embedding()
     
@@ -273,8 +428,15 @@ def qwen_embedding(texts: List[str]) -> np.ndarray:
 
 async def qwen_embedding_async(texts: List[str]) -> np.ndarray:
     """
-    Qwen Embedding异步调用函数（实际上还是同步执行，但包装为异步）
+    Qwen Embedding异步调用函数 - 支持远程/本地切换
     """
+    global _use_remote_embedding
+    
+    # 如果启用了远程服务，使用远程异步调用
+    if _use_remote_embedding:
+        return await remote_embedding_async(texts)
+    
+    # 本地模式：异步执行本地embedding
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, qwen_embedding, texts)
 
@@ -348,6 +510,29 @@ def show_oss_config():
     else:
         print(f"🌐 OSS单一服务配置:")
         print(f"  服务地址: {oss_host}:{oss_ports}")
+
+def show_embedding_config():
+    """显示当前Embedding负载均衡配置"""
+    global _use_remote_embedding
+    
+    if _use_remote_embedding:
+        embedding_host = os.getenv("EMBEDDING_HOST", "10.0.4.178")
+        embedding_ports = os.getenv("EMBEDDING_PORTS", "30151")
+        
+        if "," in embedding_ports:
+            ports_list = [port.strip() for port in embedding_ports.split(",")]
+            print(f"🔮 Embedding远程服务配置:")
+            print(f"  主机: {embedding_host}")
+            print(f"  端口数量: {len(ports_list)} 个")
+            print(f"  端口列表: {', '.join(ports_list)}")
+            print(f"  负载均衡: 轮询（Round Robin）")
+        else:
+            print(f"🔮 Embedding单一远程服务配置:")
+            print(f"  服务地址: {embedding_host}:{embedding_ports}")
+    else:
+        print(f"🔮 Embedding本地模型配置:")
+        print(f"  模型路径: {QWEN_MODEL_PATH}")
+        print(f"  运行模式: 本地GPU")
 
 if __name__ == "__main__":
     # 显示配置信息

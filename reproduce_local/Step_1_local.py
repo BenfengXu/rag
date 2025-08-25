@@ -11,7 +11,10 @@ from local_models import (
     lightrag_embedding_func_async, 
     get_embedding_dim,
     init_qwen_embedding,
-    show_oss_config
+    show_oss_config,
+    show_embedding_config,
+    enable_remote_embedding,
+    disable_remote_embedding
 )
 
 async def insert_text(rag, file_path):
@@ -50,8 +53,21 @@ async def initialize_rag():
     # 显示OSS负载均衡配置
     show_oss_config()
     
-    # 预先初始化Qwen Embedding模型
-    init_qwen_embedding()
+    # 检查是否使用远程Embedding服务
+    use_remote_embedding = os.getenv("USE_REMOTE_EMBEDDING", "false").lower() == "true"
+    if use_remote_embedding:
+        print("🔮 启用远程Embedding服务...")
+        enable_remote_embedding()
+    else:
+        print("🔮 使用本地Embedding模型...")
+        disable_remote_embedding()
+        # 仅在本地模式下才预先加载模型
+        init_qwen_embedding()
+    
+    # 显示Embedding配置
+    show_embedding_config()
+    
+    # 获取Embedding维度
     embedding_dim = get_embedding_dim()
     print(f"✅ Embedding维度: {embedding_dim}")
     
@@ -61,7 +77,7 @@ async def initialize_rag():
         llm_model_func=lightrag_llm_func_async,  # 使用OSS LLM
         embedding_func=EmbeddingFunc(
             embedding_dim=embedding_dim,
-            func=lightrag_embedding_func_async  # 使用Qwen Embedding
+            func=lightrag_embedding_func_async  # 使用Qwen Embedding (支持远程/本地)
         ),
     )
 
